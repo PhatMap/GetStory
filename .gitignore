@@ -1,0 +1,16 @@
+/output
+/.browser-profile
+/node_modules
+/.vscode
+/.idea
+/.DS_Store
+/dist
+/coverage
+/.env
+/.env.local
+/.env.development
+/.env.test
+/.env.production
+/logs
+/webpack-stats.json
+/.eslintcache
