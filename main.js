@@ -1,15 +1,21 @@
 import { chromium } from "playwright";
 import fs from "node:fs/promises";
 import path from "node:path";
+import readline from "node:readline/promises";
+import {
+  stdin as terminalInput,
+  stdout as terminalOutput,
+} from "node:process";
 
-const START_URL = "https://sangtacviet.app/truyen/dich/1/9559/740/";
+const START_URL = "https://sangtacviet.app/truyen/dich/1/9559/796/";
 const OUTPUT_DIR = "output";
 const USER_DATA_DIR = ".browser-profile";
 const PROGRESS_FILE = "progress.json";
 const MAX_CHAPTERS = 2000;
+const CHAPTER_BATCH_TAB_COUNT = 10;
 const MAX_LOAD_ATTEMPTS = 2;
-const CHAPTER_DELAY_MIN_MS = 0;
-const CHAPTER_DELAY_MAX_MS = 0;
+const CHAPTER_DELAY_MIN_MS = 100;
+const CHAPTER_DELAY_MAX_MS = 200;
 const BATCH_SIZE_BEFORE_PAUSE = 3;
 const BATCH_PAUSE_MIN_MS = 0;
 const BATCH_PAUSE_MAX_MS = 0;
@@ -17,6 +23,7 @@ const CAPTCHA_COOLDOWN_MIN_MS = 0;
 const CAPTCHA_COOLDOWN_MAX_MS = 0;
 const MANUAL_RETRY_INTERVAL_MS = 3000;
 const READCHAPTER_TIMEOUT_MS = 8000;
+const UPDATE_LINK_TIMEOUT_MS = 8000;
 const CONTENT_SELECTORS = [
   ".chapter-content",
   "#chapter-content",
@@ -44,6 +51,12 @@ const BLOCK_KEYWORDS = [
   "i am human",
   "xac minh ban la nguoi",
   "vui long xac minh",
+];
+const PREFERRED_BROWSER_EXECUTABLES = [
+  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+  "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+  "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
 ];
 
 function sanitizeFileName(input) {
@@ -109,6 +122,49 @@ async function waitRandomDelay(min, max, reason) {
   }
 
   await sleep(delayMs);
+}
+
+async function waitForEnterSignal(message) {
+  const rl = readline.createInterface({
+    input: terminalInput,
+    output: terminalOutput,
+  });
+
+  try {
+    while (true) {
+      const answer = normalizeLooseText(await rl.question(message));
+
+      if (!answer) {
+        return "continue";
+      }
+
+      if (answer === "q" || answer === "quit" || answer === "stop") {
+        return "stop";
+      }
+
+      console.log("Nhan Enter de tiep tuc, hoac go q roi Enter de dung.");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+async function resolveBrowserLaunchOptions() {
+  for (const executablePath of PREFERRED_BROWSER_EXECUTABLES) {
+    try {
+      await fs.access(executablePath);
+      return {
+        headless: false,
+        executablePath,
+      };
+    } catch {
+      // Try the next installed browser.
+    }
+  }
+
+  return {
+    headless: false,
+  };
 }
 
 function normalizeLooseText(text) {
@@ -180,6 +236,120 @@ function buildChapterUrl(origin, bookhost, bookid, chapterid) {
   }
 
   return new URL(`/truyen/${bookhost}/1/${bookid}/${chapterid}/`, origin).href;
+}
+
+const adjacentChapterUrlCache = new Map();
+
+async function fetchAdjacentChapterIds(chapterUrl) {
+  const normalizedChapterUrl = normalizeChapterUrl(chapterUrl, chapterUrl);
+  const parsedUrl = parseChapterUrl(normalizedChapterUrl || chapterUrl);
+
+  if (!parsedUrl) {
+    return {
+      prevId: null,
+      nextId: null,
+    };
+  }
+
+  const cacheKey = `${parsedUrl.bookhost}:${parsedUrl.bookid}:${parsedUrl.chapterid}`;
+
+  if (adjacentChapterUrlCache.has(cacheKey)) {
+    return adjacentChapterUrlCache.get(cacheKey);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), UPDATE_LINK_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(
+      new URL("/io/novel/updateOldLink", parsedUrl.origin),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Referer: buildChapterUrl(
+            parsedUrl.origin,
+            parsedUrl.bookhost,
+            parsedUrl.bookid,
+            parsedUrl.chapterid,
+          ),
+          "X-Requested-With": "XMLHttpRequest",
+        },
+        body: new URLSearchParams({
+          host: parsedUrl.bookhost,
+          bookid: parsedUrl.bookid,
+          chapterid: parsedUrl.chapterid,
+        }),
+        signal: controller.signal,
+      },
+    );
+    const rawText = (await response.text()).trim();
+    const [prevRaw = "", nextRaw = ""] = rawText.split("-");
+    const result = {
+      prevId: isValidChapterId(prevRaw) ? prevRaw : null,
+      nextId: isValidChapterId(nextRaw) ? nextRaw : null,
+    };
+
+    adjacentChapterUrlCache.set(cacheKey, result);
+    return result;
+  } catch {
+    return {
+      prevId: null,
+      nextId: null,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function resolveAdjacentChapterUrls(chapterUrl) {
+  const normalizedChapterUrl = normalizeChapterUrl(chapterUrl, chapterUrl);
+  const parsedUrl = parseChapterUrl(normalizedChapterUrl || chapterUrl);
+
+  if (!parsedUrl) {
+    return {
+      prevHref: null,
+      nextHref: null,
+    };
+  }
+
+  const adjacentIds = await fetchAdjacentChapterIds(normalizedChapterUrl || chapterUrl);
+
+  return {
+    prevHref: normalizeChapterUrl(
+      buildChapterUrl(
+        parsedUrl.origin,
+        parsedUrl.bookhost,
+        parsedUrl.bookid,
+        adjacentIds.prevId,
+      ),
+      normalizedChapterUrl || chapterUrl,
+    ),
+    nextHref: normalizeChapterUrl(
+      buildChapterUrl(
+        parsedUrl.origin,
+        parsedUrl.bookhost,
+        parsedUrl.bookid,
+        adjacentIds.nextId,
+      ),
+      normalizedChapterUrl || chapterUrl,
+    ),
+  };
+}
+
+async function buildChapterBatchUrls(startUrl, count, visited = new Set()) {
+  const urls = [];
+  const seen = new Set(visited);
+  let nextUrl = normalizeChapterUrl(startUrl, startUrl) || startUrl;
+
+  while (urls.length < count && nextUrl && !seen.has(nextUrl)) {
+    urls.push(nextUrl);
+    seen.add(nextUrl);
+    const adjacentUrls = await resolveAdjacentChapterUrls(nextUrl);
+    nextUrl = adjacentUrls.nextHref;
+  }
+
+  return urls;
 }
 
 function isSameBook(leftUrl, rightUrl) {
@@ -332,6 +502,73 @@ function isUsableChapter(chapter) {
       chapter.content.length >= 100 &&
       normalizeChapterUrl(chapter.url),
   );
+}
+
+function getPayloadBlockReason(payload) {
+  const payloadCode = String(payload?.code ?? "");
+
+  if (payloadCode === "21") {
+    return "captcha";
+  }
+
+  if (payloadCode === "12" || payloadCode === "13") {
+    return "login";
+  }
+
+  return null;
+}
+
+function classifyChapterAttempt(chapter, payload = null) {
+  const payloadBlockReason = getPayloadBlockReason(payload);
+
+  if (payloadBlockReason) {
+    return {
+      status: "blocked",
+      blockReason: payloadBlockReason,
+      chapter: null,
+    };
+  }
+
+  if (chapter && isUsableChapter(chapter) && !isBlockedChapter(chapter)) {
+    return {
+      status: "success",
+      blockReason: null,
+      chapter,
+    };
+  }
+
+  if (chapter && isBlockedChapter(chapter)) {
+    return {
+      status: "blocked",
+      blockReason: "captcha",
+      chapter: null,
+    };
+  }
+
+  return {
+    status: "retryable",
+    blockReason: null,
+    chapter: null,
+  };
+}
+
+function markStateAsManualStop(state, detail = "tab_da_dong") {
+  state.status = "manual_stop";
+  state.blockReason = null;
+  state.chapter = null;
+  state.stopReason = "manual_stop";
+  state.stopDetail = detail;
+  state.lastError = null;
+  return state;
+}
+
+function markStateAsFailed(state) {
+  state.status = "failed";
+  state.blockReason = null;
+  state.chapter = null;
+  state.stopReason = "load_failed";
+  state.stopDetail = `${MAX_LOAD_ATTEMPTS} lan deu khong lay duoc noi dung`;
+  return state;
 }
 
 function buildStopResult(page, url, reason, detail = null) {
@@ -610,6 +847,131 @@ async function extractChapterFromPayload(page, chapterUrl, payload) {
   };
 }
 
+async function navigateAndCollectChapter(page, url) {
+  const readChapterPromise = waitForReadChapterPayload(page, url).catch(
+    () => null,
+  );
+
+  if (page.url() !== url) {
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+  } else {
+    await page.reload({ waitUntil: "domcontentloaded" });
+  }
+
+  const payload = await readChapterPromise;
+  let chapter = null;
+
+  if (payload && !getPayloadBlockReason(payload)) {
+    const payloadCode = String(payload.code ?? "0");
+
+    if (payloadCode === "0") {
+      chapter = await extractChapterFromPayload(page, url, payload).catch(
+        () => null,
+      );
+    } else {
+      console.log(
+        `Phan hoi doc chuong chua dung: ${payload.err || payload.info || `code ${payloadCode}`}`,
+      );
+    }
+  }
+
+  if (!chapter) {
+    await page.waitForTimeout(250);
+    chapter = await extractChapter(page).catch(() => null);
+  }
+
+  return classifyChapterAttempt(chapter, payload);
+}
+
+async function inspectCurrentChapterTab(page) {
+  const chapter = await extractChapter(page).catch(() => null);
+  return classifyChapterAttempt(chapter);
+}
+
+async function inspectCurrentChapterTabAfterManualResume(page) {
+  if (!page || page.isClosed()) {
+    return {
+      status: "manual_stop",
+      blockReason: null,
+      chapter: null,
+    };
+  }
+
+  await page
+    .waitForLoadState("domcontentloaded", { timeout: READCHAPTER_TIMEOUT_MS })
+    .catch(() => null);
+
+  const checkCount = Math.max(
+    1,
+    Math.ceil(READCHAPTER_TIMEOUT_MS / Math.max(1000, MANUAL_RETRY_INTERVAL_MS)),
+  );
+  let latestAttempt = {
+    status: "retryable",
+    blockReason: null,
+    chapter: null,
+  };
+
+  for (let index = 0; index < checkCount; index += 1) {
+    latestAttempt = await inspectCurrentChapterTab(page);
+
+    if (latestAttempt.status !== "retryable") {
+      return latestAttempt;
+    }
+
+    if (index < checkCount - 1) {
+      await page.waitForTimeout(MANUAL_RETRY_INTERVAL_MS);
+    }
+  }
+
+  return latestAttempt;
+}
+
+async function loadBatchState(state, { navigate = true } = {}) {
+  if (!state.page || state.page.isClosed()) {
+    return markStateAsManualStop(state);
+  }
+
+  try {
+    if (navigate) {
+      state.attempts += 1;
+      Object.assign(state, await navigateAndCollectChapter(state.page, state.url));
+    }
+
+    state.lastError = null;
+    state.stopReason = null;
+    state.stopDetail = null;
+  } catch (error) {
+    if (!state.page || state.page.isClosed()) {
+      return markStateAsManualStop(state);
+    }
+
+    state.status = "retryable";
+    state.blockReason = null;
+    state.chapter = null;
+    state.stopReason = null;
+    state.stopDetail = null;
+    state.lastError = error instanceof Error ? error.message : String(error);
+  }
+
+  return state;
+}
+
+async function closeBatchPages(states, keepPage = null) {
+  const keepPages = new Set([keepPage].filter(Boolean));
+
+  for (const state of states) {
+    if (!state.page || state.page.isClosed() || keepPages.has(state.page)) {
+      continue;
+    }
+
+    try {
+      await state.page.close();
+    } catch {
+      // Ignore page close failures during cleanup.
+    }
+  }
+}
+
 async function loadChapterWithRecovery(
   page,
   context,
@@ -820,16 +1182,30 @@ if (
   process.exit(0);
 }
 
-const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
-  headless: false,
-});
+const browserLaunchOptions = await resolveBrowserLaunchOptions();
+const context = await chromium.launchPersistentContext(
+  USER_DATA_DIR,
+  browserLaunchOptions,
+);
 let page = context.pages()[0] ?? (await context.newPage());
 
-await page.goto(resumeUrl, { waitUntil: "domcontentloaded" });
+await closeExtraPages(context, [page]);
+
+if (browserLaunchOptions.executablePath) {
+  console.log(
+    `Dang uu tien mo trinh duyet cai san tren may: ${browserLaunchOptions.executablePath}`,
+  );
+} else {
+  console.log(
+    "Khong tim thay Chrome/Edge/Brave cai san, se dung Chromium cua Playwright.",
+  );
+}
 
 // đăng nhập tay nếu cần
 console.log("Dang dung session trong .browser-profile neu con hieu luc.");
-console.log("Script se chay lien tuc, gap captcha/login thi dong va dung ngay.");
+console.log(
+  `Script se mo toi da ${CHAPTER_BATCH_TAB_COUNT} tab cung luc. Xu ly den tab nao gap captcha/login thi script se dung o tab do, giu nguyen tab hien tai va chi doc du lieu lai sau khi ban nhan Enter.`,
+);
 
 const visited = new Set();
 let currentUrl = resumeUrl;
@@ -844,76 +1220,214 @@ if (resumeUrl !== START_URL) {
   console.log(`Dang tiep tuc tu chuong dang do: ${resumeUrl}`);
 }
 while (savedCount < MAX_CHAPTERS && currentUrl && !visited.has(currentUrl)) {
-  visited.add(currentUrl);
+  const batchUrls = await buildChapterBatchUrls(
+    currentUrl,
+    Math.min(CHAPTER_BATCH_TAB_COUNT, MAX_CHAPTERS - savedCount),
+    visited,
+  );
 
-  const recovered = await loadChapterWithRecovery(page, context, currentUrl);
-  page = recovered.page;
-  stopReason = recovered.stopReason || null;
-  stopDetail = recovered.stopDetail || null;
+  if (batchUrls.length === 0) {
+    stopReason = "invalid_batch_start";
+    stopDetail = currentUrl;
+    console.log(`Khong tao duoc batch tu URL hien tai: ${currentUrl}`);
+    break;
+  }
 
-  if (stopReason) {
+  const batchPages = [page && !page.isClosed() ? page : await context.newPage()];
+
+  while (batchPages.length < batchUrls.length) {
+    batchPages.push(await context.newPage());
+  }
+
+  const batchStates = batchUrls.map((url, index) => ({
+    url,
+    page: batchPages[index],
+    attempts: 0,
+    status: "pending",
+    blockReason: null,
+    chapter: null,
+    stopReason: null,
+    stopDetail: null,
+    lastError: null,
+  }));
+
+  console.log(
+    `Dang mo batch ${batchStates.length} tab, bat dau tu chuong: ${batchStates[0].url}`,
+  );
+
+  let shouldStop = false;
+  let savedInBatch = 0;
+  let stopPage = null;
+
+  for (let index = 0; index < batchStates.length; index += 1) {
+    const state = batchStates[index];
+
+    if (state.status === "pending") {
+      console.log(`Xu ly tab ${index + 1}/${batchStates.length}: ${state.url}`);
+      await loadBatchState(state, { navigate: true });
+    }
+
+    while (state.status === "blocked") {
+      console.log(
+        `Tab ${index + 1}/${batchStates.length} dang bi ${state.blockReason || "captcha"}: ${state.url}`,
+      );
+      const action = await waitForEnterSignal(
+        "Xu ly xong/F5 tab hien tai roi nhan Enter de lay data. Go q roi Enter de dung: ",
+      );
+
+      if (action === "stop") {
+        markStateAsManualStop(state, "user_stop");
+        break;
+      }
+
+      console.log(
+        `Dang doc du lieu tu tab ${index + 1}/${batchStates.length} ma khong reload lai: ${state.url}`,
+      );
+      Object.assign(state, await inspectCurrentChapterTabAfterManualResume(state.page));
+
+      if (state.status === "success") {
+        break;
+      }
+
+      if (state.status === "retryable") {
+        state.status = "blocked";
+        state.blockReason = "dang_cho_noi_dung";
+        console.log(
+          `Tab ${index + 1}/${batchStates.length} chua co noi dung hop le. Script se giu nguyen tab nay, ban doi load xong roi nhan Enter lai.`,
+        );
+      } else if (state.status === "blocked") {
+        console.log(
+          `Tab ${index + 1}/${batchStates.length} van dang bi ${state.blockReason || "captcha"}. Script khong tu reload tab nay.`,
+        );
+      }
+    }
+
+    while (state.status === "retryable" && state.attempts < MAX_LOAD_ATTEMPTS) {
+      console.log(`Thu tai lai tab ${index + 1}/${batchStates.length}: ${state.url}`);
+      await loadBatchState(state, { navigate: true });
+    }
+
+    if (state.status === "retryable" && state.attempts >= MAX_LOAD_ATTEMPTS) {
+      markStateAsFailed(state);
+    }
+
+    if (state.status !== "success" || !state.chapter) {
+      stopReason =
+        state.stopReason ||
+        (state.status === "blocked"
+          ? "captcha_blocked"
+          : state.status === "manual_stop"
+            ? "manual_stop"
+            : "load_failed");
+      stopDetail =
+        state.stopDetail || state.blockReason || state.lastError || state.url;
+      currentUrl = state.url;
+      shouldStop = true;
+      stopPage = state.page && !state.page.isClosed() ? state.page : null;
+      console.log(`Dung batch tai ${state.url}: ${stopReason} (${stopDetail}).`);
+      await saveProgress({
+        startUrl: START_URL,
+        nextUrl: currentUrl,
+        lastSavedUrl,
+        lastChapterName,
+        savedCount,
+        finished: false,
+        stopReason,
+        stopDetail,
+      });
+      break;
+    }
+
+    const chapter = state.chapter;
+
+    if (!isUsableChapter(chapter)) {
+      stopReason = "invalid_chapter";
+      stopDetail = chapter.url || state.url || currentUrl;
+      currentUrl = state.url || currentUrl;
+      shouldStop = true;
+      stopPage = state.page && !state.page.isClosed() ? state.page : null;
+      console.log(`Bo qua vi content qua ngan: ${chapter.url}`);
+      await saveProgress({
+        startUrl: START_URL,
+        nextUrl: currentUrl,
+        lastSavedUrl,
+        lastChapterName,
+        savedCount,
+        finished: false,
+        stopReason,
+        stopDetail,
+      });
+      break;
+    }
+
+    const chapterName = extractChapterName(chapter.title);
+    const outputPath = await buildOutputPath(chapterName);
+    const fileContent = `${chapterName}\n\n${chapter.content}\n`;
+
+    await fs.writeFile(outputPath, fileContent, "utf8");
+    const i = ++savedCount;
+    savedInBatch += 1;
+    console.log(`Da luu: ${outputPath}`);
+    console.log(`Da lay: ${i} - ${chapterName}`);
+
+    visited.add(chapter.url || state.url);
+    lastSavedUrl = chapter.url;
+    lastChapterName = chapterName;
+    currentUrl = batchStates[index + 1]?.url || normalizeChapterUrl(
+      chapter.nextHref,
+      chapter.url,
+    );
+
+    if (!currentUrl) {
+      const adjacentUrls = await resolveAdjacentChapterUrls(chapter.url);
+      currentUrl = adjacentUrls.nextHref;
+    }
+
+    if (!currentUrl) {
+      console.log("Khong tim thay link chuong tiep theo hop le. Dung lai.");
+    }
+
+    stopReason = null;
+    stopDetail = null;
     await saveProgress({
       startUrl: START_URL,
       nextUrl: currentUrl,
       lastSavedUrl,
       lastChapterName,
       savedCount,
-      finished: false,
-      stopReason,
-      stopDetail,
+      stopReason: null,
+      stopDetail: null,
     });
+  }
+
+  const shouldKeepCurrentTabOpen =
+    shouldStop && (stopReason === "captcha_blocked" || stopReason === "manual_stop");
+  page =
+    stopPage ??
+    batchStates.find((state) => state.page && !state.page.isClosed())?.page ??
+    (await context.newPage());
+  await closeBatchPages(batchStates, shouldKeepCurrentTabOpen || !shouldStop ? page : null);
+
+  if (shouldStop) {
     break;
   }
-  const chapter = recovered.chapter || { url: currentUrl };
 
-  if (!isUsableChapter(chapter)) {
-    stopReason = "invalid_chapter";
-    stopDetail = chapter.url || currentUrl;
-    console.log(`Bỏ qua vì content quá ngắn: ${chapter.url}`);
-    break;
-  }
+  sessionSavedCount += savedInBatch;
 
-  const chapterName = extractChapterName(chapter.title);
-  const outputPath = await buildOutputPath(chapterName);
-  const fileContent = `${chapterName}\n\n${chapter.content}\n`;
-
-  await fs.writeFile(outputPath, fileContent, "utf8");
-  const i = ++savedCount;
-  console.log(`Da luu: ${outputPath}`);
-  console.log(`Đã lấy: ${i} - ${chapterName}`);
-
-  lastSavedUrl = chapter.url;
-  lastChapterName = chapterName;
-  currentUrl = normalizeChapterUrl(chapter.nextHref, chapter.url);
-
-  if (!currentUrl) {
-    console.log("Khong tim thay link chuong tiep theo hop le. Dung lai.");
-  }
-  await saveProgress({
-    startUrl: START_URL,
-    nextUrl: currentUrl,
-    lastSavedUrl,
-    lastChapterName,
-    savedCount,
-    stopReason: null,
-    stopDetail: null,
-  });
-
-  await closeExtraPages(context, [page]);
-  sessionSavedCount += 1;
-
-  if (sessionSavedCount % BATCH_SIZE_BEFORE_PAUSE === 0) {
-    await waitRandomDelay(
-      BATCH_PAUSE_MIN_MS,
-      BATCH_PAUSE_MAX_MS,
-      `Da lay ${sessionSavedCount} chuong trong phien nay, tam nghi`,
-    );
-  } else {
-    await waitRandomDelay(
-      CHAPTER_DELAY_MIN_MS,
-      CHAPTER_DELAY_MAX_MS,
-      "Cho truoc khi qua chuong tiep theo trong",
-    );
+  if (savedInBatch > 0) {
+    if (sessionSavedCount % BATCH_SIZE_BEFORE_PAUSE === 0) {
+      await waitRandomDelay(
+        BATCH_PAUSE_MIN_MS,
+        BATCH_PAUSE_MAX_MS,
+        `Da lay ${sessionSavedCount} chuong trong phien nay, tam nghi`,
+      );
+    } else {
+      await waitRandomDelay(
+        CHAPTER_DELAY_MIN_MS,
+        CHAPTER_DELAY_MAX_MS,
+        "Cho truoc khi mo batch tiep theo trong",
+      );
+    }
   }
 }
 
@@ -930,6 +1444,10 @@ await saveProgress({
   stopDetail,
 });
 
-await context.close();
+if (stopReason === "captcha_blocked" || stopReason === "manual_stop") {
+  console.log("Da giu nguyen tab hien tai de ban tiep tuc xu ly.");
+} else {
+  await context.close();
+}
 
 console.log(`Xong. Cac file nam trong thu muc: ${OUTPUT_DIR}`);

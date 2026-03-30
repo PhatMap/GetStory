@@ -14,3 +14,4 @@
 /logs
 /webpack-stats.json
 /.eslintcache
+progress.json
