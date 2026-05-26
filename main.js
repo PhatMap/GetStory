@@ -50,9 +50,11 @@ function readBooleanConfig(name, fallback) {
   return fallback;
 }
 
-const DEFAULT_START_URL = "https://sangtacviet.app/truyen/faloo/1/1212351/2/";
+const DEFAULT_START_URL =
+  "https://truyenchu.net/truyen/vu-luyen-dien-phong/chuong-75/";
 const START_URL = processEnv.START_URL || DEFAULT_START_URL;
-const OUTPUT_DIR = processEnv.OUTPUT_DIR || "output-2";
+const TARGET_CHAPTERS_RAW = processEnv.TARGET_CHAPTERS || "";
+const OUTPUT_DIR = processEnv.OUTPUT_DIR || "output-3";
 const USER_DATA_DIR = processEnv.USER_DATA_DIR || ".browser-profile";
 const PROGRESS_FILE = processEnv.PROGRESS_FILE || "progress.json";
 const MAX_CHAPTERS = readIntegerConfig("MAX_CHAPTERS", 2000, { min: 1 });
@@ -60,35 +62,35 @@ const CHAPTER_BATCH_TAB_COUNT = readIntegerConfig("CHAPTER_BATCH_TAB_COUNT", 1, 
   min: 1,
 });
 const MAX_LOAD_ATTEMPTS = readIntegerConfig("MAX_LOAD_ATTEMPTS", 10, { min: 1 });
-const CHAPTER_DELAY_MIN_MS = readIntegerConfig("CHAPTER_DELAY_MIN_MS", 60000, {
+const CHAPTER_DELAY_MIN_MS = readIntegerConfig("CHAPTER_DELAY_MIN_MS", 0, {
   min: 0,
 });
-const CHAPTER_DELAY_MAX_MS = readIntegerConfig("CHAPTER_DELAY_MAX_MS", 60000, {
+const CHAPTER_DELAY_MAX_MS = readIntegerConfig("CHAPTER_DELAY_MAX_MS", 0, {
   min: 0,
 });
-const RETRY_DELAY_MIN_MS = readIntegerConfig("RETRY_DELAY_MIN_MS", 120000, {
+const RETRY_DELAY_MIN_MS = readIntegerConfig("RETRY_DELAY_MIN_MS", 0, {
   min: 0,
 });
-const RETRY_DELAY_MAX_MS = readIntegerConfig("RETRY_DELAY_MAX_MS", 160000, {
+const RETRY_DELAY_MAX_MS = readIntegerConfig("RETRY_DELAY_MAX_MS", 0, {
   min: 0,
 });
 const BATCH_SIZE_BEFORE_PAUSE = readIntegerConfig("BATCH_SIZE_BEFORE_PAUSE", 5, {
   min: 1,
 });
-const BATCH_PAUSE_MIN_MS = readIntegerConfig("BATCH_PAUSE_MIN_MS", 60000, {
+const BATCH_PAUSE_MIN_MS = readIntegerConfig("BATCH_PAUSE_MIN_MS", 0, {
   min: 0,
 });
-const BATCH_PAUSE_MAX_MS = readIntegerConfig("BATCH_PAUSE_MAX_MS", 60000, {
+const BATCH_PAUSE_MAX_MS = readIntegerConfig("BATCH_PAUSE_MAX_MS", 0, {
   min: 0,
 });
 const CAPTCHA_COOLDOWN_MIN_MS = readIntegerConfig(
   "CAPTCHA_COOLDOWN_MIN_MS",
-  120000,
+  0,
   { min: 0 },
 );
 const CAPTCHA_COOLDOWN_MAX_MS = readIntegerConfig(
   "CAPTCHA_COOLDOWN_MAX_MS",
-  160000,
+  0,
   { min: 0 },
 );
 const AUTO_BLOCK_RECOVERY = readBooleanConfig("AUTO_BLOCK_RECOVERY", true);
@@ -311,6 +313,20 @@ function extractChapterName(title) {
   return firstPart;
 }
 
+function normalizeChapterTitleForSaving(title) {
+  const extracted = extractChapterName(title);
+  const compact = (extracted || "").replace(/\s+/g, " ").trim();
+  const match = compact.match(
+    /^(chuong|chương|chapter)\s*(\d+)\s*[-:]\s*(.+)$/iu,
+  );
+
+  if (match) {
+    return `Chương ${match[2]}: ${match[3].trim()}`;
+  }
+
+  return compact || "Untitled";
+}
+
 function buildOrderFallbackChapterName(orderNumber) {
   return `Thu ${Math.max(1, Math.trunc(Number(orderNumber) || 1))}`;
 }
@@ -328,7 +344,9 @@ function isMissingChapterName(chapterName) {
 }
 
 function buildChapterNameForSaving(chapter, orderNumber) {
-  const extractedName = extractChapterName(chapter?.chapterName || chapter?.title);
+  const extractedName = normalizeChapterTitleForSaving(
+    chapter?.chapterName || chapter?.title,
+  );
 
   if (chapter?.missingTitle || isMissingChapterName(extractedName)) {
     return buildOrderFallbackChapterName(orderNumber);
@@ -337,7 +355,59 @@ function buildChapterNameForSaving(chapter, orderNumber) {
   return extractedName;
 }
 
+function parseTargetChapterNumbers(rawInput) {
+  if (!rawInput || !rawInput.trim()) {
+    return [];
+  }
+
+  const seen = new Set();
+  const numbers = [];
+  const parts = rawInput
+    .split(/[,\s]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  for (const part of parts) {
+    const value = Number(part);
+    if (!Number.isInteger(value) || value <= 0) {
+      continue;
+    }
+    if (seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    numbers.push(value);
+  }
+
+  return numbers;
+}
+
+function parseTruyenChuChapterUrl(chapterUrl) {
+  try {
+    const parsedUrl = new URL(chapterUrl);
+    const match = parsedUrl.pathname.match(/^\/truyen\/([^/]+)\/chuong-(\d+)\/?$/i);
+
+    if (!match) {
+      return null;
+    }
+
+    return {
+      origin: parsedUrl.origin,
+      bookhost: match[1],
+      chapterid: match[2],
+      siteType: "truyenchu",
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseChapterUrl(chapterUrl) {
+  const truyenchuParsed = parseTruyenChuChapterUrl(chapterUrl);
+  if (truyenchuParsed) {
+    return truyenchuParsed;
+  }
+
   try {
     const parsedUrl = new URL(chapterUrl);
     const match = parsedUrl.pathname.match(
@@ -353,6 +423,7 @@ function parseChapterUrl(chapterUrl) {
       bookhost: match[1],
       bookid: match[2],
       chapterid: match[3],
+      siteType: "sangtacviet",
     };
   } catch {
     return null;
@@ -447,6 +518,26 @@ async function resolveAdjacentChapterUrls(chapterUrl) {
     };
   }
 
+  if (parsedUrl.siteType === "truyenchu") {
+    const chapterNumber = Number(parsedUrl.chapterid);
+    const prevChapter = chapterNumber - 1;
+    const nextChapter = chapterNumber + 1;
+
+    return {
+      prevHref:
+        prevChapter > 0
+          ? normalizeChapterUrl(
+              `${parsedUrl.origin}/truyen/${parsedUrl.bookhost}/chuong-${prevChapter}/`,
+              normalizedChapterUrl || chapterUrl,
+            )
+          : null,
+      nextHref: normalizeChapterUrl(
+        `${parsedUrl.origin}/truyen/${parsedUrl.bookhost}/chuong-${nextChapter}/`,
+        normalizedChapterUrl || chapterUrl,
+      ),
+    };
+  }
+
   const adjacentIds = await fetchAdjacentChapterIds(normalizedChapterUrl || chapterUrl);
 
   return {
@@ -493,8 +584,10 @@ function isSameBook(leftUrl, rightUrl) {
   return Boolean(
     left &&
     right &&
+    left.siteType === right.siteType &&
+    left.origin === right.origin &&
     left.bookhost === right.bookhost &&
-    left.bookid === right.bookid,
+    (left.siteType === "truyenchu" || left.bookid === right.bookid),
   );
 }
 
@@ -521,6 +614,22 @@ function normalizeChapterUrl(candidateUrl, referenceUrl = null) {
   } catch {
     return null;
   }
+}
+
+function buildTargetChapterUrlsFromStart(startUrl, chapterNumbers) {
+  const parsedStart = parseTruyenChuChapterUrl(startUrl);
+  if (!parsedStart || chapterNumbers.length === 0) {
+    return [];
+  }
+
+  return chapterNumbers
+    .map((chapterNumber) =>
+      normalizeChapterUrl(
+        `${parsedStart.origin}/truyen/${parsedStart.bookhost}/chuong-${chapterNumber}/`,
+        startUrl,
+      ),
+    )
+    .filter(Boolean);
 }
 
 function parseReadChapterPayload(rawText) {
@@ -1009,7 +1118,7 @@ async function extractChapterFromPayload(page, chapterUrl, payload) {
   const origin = parsedChapterUrl?.origin ?? new URL(chapterUrl).origin;
   const bookhost = payload.bookhost || parsedChapterUrl?.bookhost;
   const bookid = String(payload.bookid || parsedChapterUrl?.bookid || "");
-  const title = payload.chaptername || "Untitled";
+  const title = normalizeChapterTitleForSaving(payload.chaptername || "Untitled");
   const content = await convertChapterHtmlToText(page, payload.data || "");
   const navigationLinks = await getNavigationLinks(page);
 
@@ -1042,7 +1151,7 @@ async function extractChapterFromPayload(page, chapterUrl, payload) {
 
   return {
     title,
-    chapterName: extractChapterName(title),
+    chapterName: title,
     missingTitle: isMissingChapterName(title),
     content,
     contentSource: "payload",
@@ -1326,7 +1435,11 @@ async function loadChapterWithRecovery(
 
 async function extractChapter(page) {
   return await page.evaluate((selectors) => {
+    const breadcrumbActive = document.querySelector(
+      ".entry-header_wrap .breadcrumb li.active",
+    )?.innerText?.trim();
     const title =
+      breadcrumbActive ||
       document.querySelector("h1")?.innerText?.trim() ||
       document.title?.trim() ||
       "Untitled";
@@ -1386,6 +1499,7 @@ async function extractChapter(page) {
 
     return {
       title,
+      chapterName: title,
       content,
       contentSource,
       contentSelector,
@@ -1402,9 +1516,32 @@ if (START_URL === "DAN_LINK_CHUONG_DAU") {
 }
 
 await fs.mkdir(OUTPUT_DIR, { recursive: true });
+const targetChapterNumbers = parseTargetChapterNumbers(TARGET_CHAPTERS_RAW);
+const targetChapterUrls = buildTargetChapterUrlsFromStart(
+  START_URL,
+  targetChapterNumbers,
+);
+const hasTargetChapterMode = targetChapterUrls.length > 0;
+
+if (TARGET_CHAPTERS_RAW.trim() && !hasTargetChapterMode) {
+  console.log(
+    "TARGET_CHAPTERS da duoc khai bao nhung START_URL khong dung dinh dang truyenchu.net /truyen/<slug>/chuong-<so>/.",
+  );
+}
+
+if (hasTargetChapterMode) {
+  console.log(
+    `Dang bat che do lay chuong theo danh sach roi: ${targetChapterNumbers.join(", ")}`,
+  );
+}
+
 const savedProgress = await loadProgress();
 const savedNextUrl = normalizeChapterUrl(savedProgress?.nextUrl, START_URL);
-const resumeUrl = savedNextUrl || START_URL;
+const resumeUrl = hasTargetChapterMode
+  ? (savedNextUrl && targetChapterUrls.includes(savedNextUrl)
+      ? savedNextUrl
+      : targetChapterUrls[0])
+  : (savedNextUrl || START_URL);
 
 if (savedProgress?.nextUrl && !savedNextUrl) {
   console.log(
@@ -1465,11 +1602,23 @@ if (resumeUrl !== START_URL) {
   console.log(`Dang tiep tuc tu chuong dang do: ${resumeUrl}`);
 }
 while (savedCount < MAX_CHAPTERS && currentUrl && !visited.has(currentUrl)) {
-  const batchUrls = await buildChapterBatchUrls(
-    currentUrl,
-    Math.min(CHAPTER_BATCH_TAB_COUNT, MAX_CHAPTERS - savedCount),
-    visited,
-  );
+  let batchUrls = [];
+
+  if (hasTargetChapterMode) {
+    const pendingTargetUrls = targetChapterUrls.filter((url) => !visited.has(url));
+    if (pendingTargetUrls.length > 0) {
+      batchUrls = pendingTargetUrls.slice(
+        0,
+        Math.min(CHAPTER_BATCH_TAB_COUNT, MAX_CHAPTERS - savedCount),
+      );
+    }
+  } else {
+    batchUrls = await buildChapterBatchUrls(
+      currentUrl,
+      Math.min(CHAPTER_BATCH_TAB_COUNT, MAX_CHAPTERS - savedCount),
+      visited,
+    );
+  }
 
   if (batchUrls.length === 0) {
     stopReason = "invalid_batch_start";
@@ -1656,14 +1805,19 @@ while (savedCount < MAX_CHAPTERS && currentUrl && !visited.has(currentUrl)) {
     visited.add(chapter.url || state.url);
     lastSavedUrl = chapter.url;
     lastChapterName = chapterName;
-    currentUrl = batchStates[index + 1]?.url || normalizeChapterUrl(
-      chapter.nextHref,
-      chapter.url,
-    );
+    if (hasTargetChapterMode) {
+      currentUrl =
+        targetChapterUrls.find((url) => !visited.has(url)) || null;
+    } else {
+      currentUrl = batchStates[index + 1]?.url || normalizeChapterUrl(
+        chapter.nextHref,
+        chapter.url,
+      );
 
-    if (!currentUrl) {
-      const adjacentUrls = await resolveAdjacentChapterUrls(chapter.url);
-      currentUrl = adjacentUrls.nextHref;
+      if (!currentUrl) {
+        const adjacentUrls = await resolveAdjacentChapterUrls(chapter.url);
+        currentUrl = adjacentUrls.nextHref;
+      }
     }
 
     if (!currentUrl) {

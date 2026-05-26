@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node main.js"
+    "start": "node main.js",
+    "merge": "node group.js"
   },
   "dependencies": {
     "playwright": "^1.58.2"
